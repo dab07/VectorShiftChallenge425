@@ -1,7 +1,5 @@
 from fastapi import FastAPI, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pymongo_auth_aws.auth import aws_temp_credentials
-from watchfiles import awatch
 
 from integrations.airtable import authorize_airtable, get_items_airtable, oauth2callback_airtable, get_airtable_credentials
 from integrations.notion import authorize_notion, get_items_notion, oauth2callback_notion, get_notion_credentials

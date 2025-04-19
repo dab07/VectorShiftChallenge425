@@ -1,5 +1,3 @@
-# hubspot.py
-
 import json
 import secrets
 import base64
@@ -22,25 +20,34 @@ TOKEN_URL = "https://api.hubapi.com/oauth/v1/token"
 SCOPES = "crm.objects.companies.read"
 
 
+# ------------------------------------------
+# STEP 1: Generate Authorization URL
+# ------------------------------------------
+"""
+    authorize_hubspot(user_id: str, org_id: str) -> str
+
+    Generates a secure OAuth URL to redirect the user to HubSpot for login and authorization.
+
+    - Stores a unique state in Redis for CSRF protection.
+    - Builds the authorization URL with client_id, redirect_uri, scope, and encoded state.
+
+    @param user_id: ID of the user initiating the request
+    @param org_id: Organization ID
+    @return: A complete HubSpot authorization URL to open in the frontend
+"""
 async def authorize_hubspot(user_id, org_id):
-    # Create a secure state with user and org information
     state_data = {
         "state": secrets.token_urlsafe(32),
         "user_id": user_id,
         "org_id": org_id
     }
 
-    # Encode state for secure transmission
     encoded_state = base64.urlsafe_b64encode(json.dumps(state_data).encode('utf-8')).decode('utf-8')
-
-    # Store state in Redis for verification during callback
     await add_key_value_redis(f"hubspot_state:{org_id}:{user_id}", json.dumps(state_data), expire=600)
 
-    # Create code verifier for PKCE (if needed)
     code_verifier = secrets.token_urlsafe(32)
     await add_key_value_redis(f"hubspot_verifier:{org_id}:{user_id}", code_verifier, expire=600)
 
-    # Build authorization URL
     query_params = {
         "client_id": CLIENT_ID,
         "redirect_uri": REDIRECT_URI,
@@ -52,34 +59,40 @@ async def authorize_hubspot(user_id, org_id):
     return auth_url
 
 
+# ------------------------------------------
+# STEP 2: Handle OAuth Callback
+# ------------------------------------------
+"""
+    oauth2callback_hubspot(request: Request) -> HTMLResponse
+
+    Handles the OAuth redirect from HubSpot after user login.
+    - Verifies the state to ensure it's secure.
+    - Exchanges the temporary code for an access token.
+    - Stores the credentials in Redis for retrieval by the frontend.
+
+    @param request: FastAPI Request object containing query params from HubSpot
+    @return: HTML response that closes the popup window in the frontend
+"""
 async def oauth2callback_hubspot(request: Request):
-    # Check for errors in the callback
     if request.query_params.get('error'):
         raise HTTPException(status_code=400, detail=request.query_params.get('error_description'))
 
-    # Get code and state from the request
     code = request.query_params.get('code')
     encoded_state = request.query_params.get('state')
-
-    # Decode the state
     state_data = json.loads(base64.urlsafe_b64decode(encoded_state).decode('utf-8'))
 
-    # Extract information from state
     original_state = state_data.get('state')
     user_id = state_data.get('user_id')
     org_id = state_data.get('org_id')
 
-    # Get saved state and verifier from Redis
     saved_state, code_verifier = await asyncio.gather(
         get_value_redis(f"hubspot_state:{org_id}:{user_id}"),
         get_value_redis(f"hubspot_verifier:{org_id}:{user_id}"),
     )
 
-    # Verify state
     if not saved_state or original_state != json.loads(saved_state).get('state'):
         raise HTTPException(status_code=400, detail='State does not match.')
 
-    # Exchange code for token
     async with httpx.AsyncClient() as client:
         response, _, _ = await asyncio.gather(
             client.post(
@@ -91,18 +104,14 @@ async def oauth2callback_hubspot(request: Request):
                     'client_id': CLIENT_ID,
                     'client_secret': CLIENT_SECRET,
                 },
-                headers={
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                }
+                headers={'Content-Type': 'application/x-www-form-urlencoded'}
             ),
             delete_key_redis(f"hubspot_state:{org_id}:{user_id}"),
             delete_key_redis(f"hubspot_verifier:{org_id}:{user_id}"),
         )
 
-    # Store credentials in Redis
     await add_key_value_redis(f"hubspot_credentials:{org_id}:{user_id}", json.dumps(response.json()), expire=600)
 
-    # Return HTML to close the popup window
     close_window_script = """
     <html>
         <script>
@@ -113,27 +122,51 @@ async def oauth2callback_hubspot(request: Request):
     return HTMLResponse(content=close_window_script)
 
 
+# ------------------------------------------
+# STEP 3: Get Stored Credentials
+# ------------------------------------------
+"""
+    get_hubspot_credentials(user_id: str, org_id: str) -> dict
+
+    Retrieves the stored access token from Redis after successful OAuth.
+
+    @param user_id: ID of the user
+    @param org_id: Organization ID
+    @return: A dictionary containing the access token and other auth info
+"""
 async def get_hubspot_credentials(user_id, org_id):
-    # Get credentials from Redis
     credentials = await get_value_redis(f"hubspot_credentials:{org_id}:{user_id}")
     if not credentials:
         raise HTTPException(status_code=400, detail='No credentials found.')
 
-    # Parse credentials and delete from Redis
     credentials = json.loads(credentials)
     await delete_key_redis(f"hubspot_credentials:{org_id}:{user_id}")
-
     return credentials
 
 
+# ------------------------------------------
+# STEP 4: Normalize HubSpot Record
+# ------------------------------------------
+"""
+    create_integration_item_metadata_object(response_json: dict, item_type: str, ...) -> IntegrationItem
+
+    Converts a raw HubSpot record into a standardized IntegrationItem object.
+
+    @param response_json: Raw company object from HubSpot API
+    @param item_type: Type of item (e.g., 'hubspot_company')
+    @param parent_id: Optional parent ID
+    @param parent_name: Optional parent name
+    @return: IntegrationItem instance with normalized structure
+"""
 def create_integration_item_metadata_object(
-    response_json: str, item_type: str, parent_id=None, parent_name=None
+        response_json: dict, item_type: str, parent_id=None, parent_name=None
 ) -> IntegrationItem:
     parent_id = None if parent_id is None else parent_id + '_Base'
+    properties = response_json.get('properties', {})
+
     integration_item_metadata = IntegrationItem(
-        id=response_json.get('id', None) + '_' + item_type,
-        name=response_json.get('properties', None).get('name', None),
-        domain=response_json.get('properties', None).get('domain', None),
+        id=response_json.get('id', '') + '_' + item_type,
+        name=properties.get('name', 'Unnamed'),
         type=item_type,
         parent_id=parent_id,
         parent_path_or_name=parent_name,
@@ -141,7 +174,21 @@ def create_integration_item_metadata_object(
     return integration_item_metadata
 
 
+# ------------------------------------------
+# STEP 5: Fetch Paginated HubSpot Data
+# ------------------------------------------
+"""
+    fetch_items(access_token: str, url: str, aggregated_response: list, after: str = None)
 
+    Fetches all pages of company data from the HubSpot API using pagination.
+    Appends results to a shared list.
+
+    @param access_token: OAuth token for HubSpot
+    @param url: HubSpot API endpoint
+    @param aggregated_response: List to store all records
+    @param after: Optional pagination token from previous response
+    @return: None (modifies aggregated_response in-place)
+"""
 def fetch_items(access_token: str, url: str, aggregated_response: list, after=None):
     params = {'limit': 100}
     if after:
@@ -152,8 +199,7 @@ def fetch_items(access_token: str, url: str, aggregated_response: list, after=No
     if response.status_code == 200:
         json_data = response.json()
         results = json_data.get('results', [])
-        for item in results:
-            aggregated_response.append(item)
+        aggregated_response.extend(results)
 
         paging = json_data.get('paging', {})
         next_page = paging.get('next', {}).get('after')
@@ -161,12 +207,25 @@ def fetch_items(access_token: str, url: str, aggregated_response: list, after=No
             fetch_items(access_token, url, aggregated_response, next_page)
 
 
+# ------------------------------------------
+# STEP 6: Main Load Function
+# ------------------------------------------
+"""
+    get_items_hubspot(credentials: dict or str) -> list[IntegrationItem]
+
+    Loads company records from HubSpot using the given credentials,
+    normalizes them, and returns them as IntegrationItem objects.
+
+    @param credentials: Auth token either as dict or JSON string
+    @return: List of IntegrationItem objects for the frontend
+"""
 async def get_items_hubspot(credentials):
     if isinstance(credentials, str):
         credentials = json.loads(credentials)
     url = 'https://api.hubapi.com/crm/v3/objects/companies'
     list_of_integration_item_metadata = []
     list_of_responses = []
+
     fetch_items(credentials.get('access_token'), url, list_of_responses)
     for response in list_of_responses:
         list_of_integration_item_metadata.append(
